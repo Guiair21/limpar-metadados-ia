@@ -12,6 +12,7 @@ Uso:
 - Nunca altera o original. Grava <nome>_limpo.<ext> na pasta de saída.
 """
 import argparse
+import json
 import os
 import re
 import shutil
@@ -47,69 +48,148 @@ MARCAS = [
 # Marcas curtas demais geram falso positivo se vierem soltas dentro de pixels;
 # só contam se aparecerem cercadas por não-alfanuméricos.
 MARCAS_CURTAS = {b"Veo", b"c2pa", b"jumb", b"OpenAI", b"Imagen", b"Gemini", b"CapCut"}
+# As de 3 e 4 letras aparecem por acaso em dado binário (paleta, tabelas de
+# amostras, perfil de cor), então só contam onde cabe texto.
+MARCAS_SO_EM_TEXTO = {b"Veo", b"c2pa", b"jumb"}
 
 C2PA_UUID = bytes.fromhex("d8fec3d61b0e483c92975828877ec481")
 XMP_UUID = bytes.fromhex("be7acfcb97a942e89c71999491e3afac")
 
 
 def achar_marcas(dados: bytes, tipo: str = None, saida: bool = False):
-    if tipo:
-        dados = (regioes_do_arquivo_limpo if saida else regioes_de_metadado)(tipo, dados)
+    """Procura as marcas. Sem `tipo`, varre os bytes como vieram.
+    Com `tipo`, separa o arquivo em duas regiões: TEXTO (onde cabe metadado
+    escrito) e BINÁRIO (tabelas, paleta, perfil de cor). As marcas de 3 e 4
+    letras só contam no TEXTO, porque em dado binário elas aparecem por acaso."""
     achados = {}
+    if tipo:
+        texto, binario, estrutura = (regioes_do_arquivo_limpo if saida else regioes_de_metadado)(tipo, dados)
+        for rotulo in estrutura:
+            achados[rotulo] = 1
+    else:
+        texto, binario = dados, b""
+    tudo = texto + b"\x00" + binario
     for marca, rotulo in MARCAS:
+        onde = texto if (saida or marca in MARCAS_SO_EM_TEXTO) else tudo
         if marca in MARCAS_CURTAS:
             padrao = re.compile(rb"(?<![A-Za-z])" + re.escape(marca) + rb"(?![a-z])")
-            if padrao.search(dados):
+            if padrao.search(onde):
                 achados[rotulo] = achados.get(rotulo, 0) + 1
-        elif marca in dados:
+        elif marca in onde:
             achados[rotulo] = achados.get(rotulo, 0) + 1
-    if C2PA_UUID in dados:
+    if C2PA_UUID in tudo:
         achados["caixa uuid do C2PA (vídeo)"] = 1
-    if XMP_UUID in dados:
+    if XMP_UUID in tudo:
         achados["caixa uuid de XMP (vídeo)"] = 1
     return sorted(achados)
 
 
-def regioes_do_arquivo_limpo(tipo: str, dados: bytes) -> bytes:
-    """Para conferir a SAÍDA: todo segmento/bloco que não é dado de imagem."""
-    out = bytearray()
+def _jpeg_permitido(m: int, tam: int, bloco: bytes) -> bool:
+    """Os únicos segmentos APPn que a limpeza mantém; COM nunca fica."""
+    if m == 0xE0:  # JFIF exato (16 bytes); JFXX e outros APP0 saem
+        return tam == 16 and bloco[4:9] == b"JFIF\x00"
+    if m == 0xE2:  # perfil de cor, não é metadado de autoria
+        return bloco[4:16].startswith(b"ICC_PROFILE")
+    if m == 0xEE:  # flag de espaço de cor da Adobe, exata (14 bytes)
+        return tam == 14 and bloco[4:9] == b"Adobe"
+    return not (0xE0 <= m <= 0xEF or m == 0xFE)  # tabelas e quadros da imagem
+
+
+def regioes_do_arquivo_limpo(tipo: str, dados: bytes):
+    """Para conferir a SAÍDA. Devolve (texto, binario, estrutura).
+    estrutura = lista do que não deveria existir num arquivo limpo."""
+    texto, binario, estrutura = bytearray(), bytearray(), []
     if tipo == "jpeg":
         i, n = 2, len(dados)
         while i + 4 <= n and dados[i] == 0xFF:
             m = dados[i + 1]
             if m == 0xD9:
-                out += dados[i + 2:]
+                if dados[i + 2:]:
+                    estrutura.append("dados depois do fim da imagem (JPG)")
+                    texto += dados[i + 2:]
                 break
             if m in (0x01, 0xD8) or 0xD0 <= m <= 0xD7:
                 i += 2
                 continue
             tam = struct.unpack(">H", dados[i + 2:i + 4])[0]
-            out += dados[i:i + 2 + tam]
+            bloco = dados[i:i + 2 + tam]
+            if _jpeg_permitido(m, tam, bloco):
+                binario += bloco
+            else:
+                estrutura.append("bloco de metadado que deveria ter saído (JPG)")
+                texto += bloco
             i += 2 + tam
             if m == 0xDA:
                 while i + 1 < n and not (dados[i] == 0xFF and dados[i + 1] not in (0x00, 0xFF) and not 0xD0 <= dados[i + 1] <= 0xD7):
                     i += 1
-        return bytes(out)
+        return bytes(texto), bytes(binario), sorted(set(estrutura))
     if tipo == "png":
         i = 8
         while i + 8 <= len(dados):
             tam = struct.unpack(">I", dados[i:i + 4])[0]
             t = dados[i + 4:i + 8]
-            if t not in (b"IDAT", b"fdAT"):
-                out += dados[i:i + 12 + tam]
-            i += 12 + tam
-        return bytes(out)
+            fim = i + 12 + tam
+            if not _chunk_png_ok(t, tam):
+                estrutura.append("bloco de metadado que deveria ter saído (PNG)")
+                texto += dados[i:fim]
+            elif t not in (b"IDAT", b"fdAT"):  # inclui o perfil de cor, mantido inteiro
+                binario += dados[i:fim]
+            i = fim
+            if t == b"IEND":
+                if dados[i:]:
+                    estrutura.append("dados depois do fim da imagem (PNG)")
+                    texto += dados[i:]
+                break
+        return bytes(texto), bytes(binario), sorted(set(estrutura))
     return regioes_de_metadado(tipo, dados)
 
 
-def regioes_de_metadado(tipo: str, dados: bytes) -> bytes:
-    """Devolve só os bytes que podem carregar metadado (sem pixels nem amostras)."""
-    out = bytearray()
+# Caixas do MP4/MOV que só agrupam outras, e caixas que são tabela numérica pura.
+_MP4_CONTEINERES = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts", b"mvex",
+                    b"moof", b"traf", b"mfra", b"dinf"}
+_MP4_TABELAS = {b"stts", b"ctts", b"stsc", b"stsz", b"stz2", b"stco", b"co64", b"stss",
+                b"stps", b"sdtp", b"sbgp", b"saiz", b"saio", b"senc", b"trun", b"tfra",
+                b"sidx", b"elst", b"cslg", b"subs"}
+
+
+def _mp4_regioes(dados: bytes, i: int, fim: int, texto: bytearray, binario: bytearray):
+    while i + 8 <= fim:
+        tam = struct.unpack(">I", dados[i:i + 4])[0]
+        nome = dados[i + 4:i + 8]
+        cab = 8
+        if tam == 1:
+            if i + 16 > fim:
+                break
+            tam = struct.unpack(">Q", dados[i + 8:i + 16])[0]
+            cab = 16
+        elif tam == 0:
+            tam = fim - i
+        if tam < cab or i + tam > fim:
+            texto += dados[i:fim]  # estrutura estranha: varre como texto, melhor um alarme a mais
+            return
+        if nome == b"mdat":
+            pass  # amostras de vídeo e áudio
+        elif nome in _MP4_TABELAS:
+            binario += dados[i:i + tam]
+        elif nome in _MP4_CONTEINERES:
+            texto += dados[i:i + cab]
+            _mp4_regioes(dados, i + cab, i + tam, texto, binario)
+        else:
+            texto += dados[i:i + tam]
+        i += tam
+
+
+def regioes_de_metadado(tipo: str, dados: bytes):
+    """Para a ENTRADA. Devolve (texto, binario, estrutura): só os bytes que
+    podem carregar metadado, sem pixels nem amostras."""
+    texto, binario = bytearray(), bytearray()
     if tipo == "jpeg":
         try:
-            out += _ler_jpeg(dados)[1]
+            _, descartado, sobra = _ler_jpeg(dados)
+            texto += descartado
+            binario += sobra  # miniatura, vídeo de Motion Photo: dado binário
         except ValueError:
-            out += dados  # arquivo estranho: varre tudo, melhor um alarme a mais
+            texto += dados  # arquivo estranho: varre tudo, melhor um alarme a mais
     elif tipo == "png":
         i = 8
         while i + 8 <= len(dados):
@@ -117,28 +197,14 @@ def regioes_de_metadado(tipo: str, dados: bytes) -> bytes:
             tipo_chunk = dados[i + 4:i + 8]
             fim = i + 12 + tam
             if not _chunk_png_ok(tipo_chunk, tam):
-                out += dados[i:fim]
+                texto += dados[i:fim]
             i = fim
             if tipo_chunk == b"IEND":
-                out += dados[i:]  # sobra depois do IEND
+                binario += dados[i:]  # sobra depois do IEND
                 break
     elif tipo == "mp4":
-        i = 0
-        while i + 8 <= len(dados):
-            tam = struct.unpack(">I", dados[i:i + 4])[0]
-            nome = dados[i + 4:i + 8]
-            cab = 8
-            if tam == 1:
-                tam = struct.unpack(">Q", dados[i + 8:i + 16])[0]
-                cab = 16
-            elif tam == 0:
-                tam = len(dados) - i
-            if tam < cab:
-                break
-            if nome != b"mdat":
-                out += dados[i:i + tam]
-            i += tam
-    return bytes(out)
+        _mp4_regioes(dados, 0, len(dados), texto, binario)
+    return bytes(texto), bytes(binario), []
 
 
 def tipo_do_arquivo(caminho: str):
@@ -184,8 +250,8 @@ def jpeg_orientacao(dados: bytes) -> int:
 
 
 def _ler_jpeg(dados: bytes):
-    """Percorre o JPEG pela estrutura. Devolve (mantido, descartado).
-    descartado = segmentos APPn/COM removidos + tudo depois do EOI da imagem principal."""
+    """Percorre o JPEG pela estrutura. Devolve (mantido, descartado, sobra).
+    descartado = segmentos APPn/COM removidos; sobra = tudo depois do EOI da imagem principal."""
     if dados[:2] != b"\xff\xd8":
         raise ValueError("JPEG inválido (sem SOI)")
     mantido = bytearray(b"\xff\xd8")
@@ -202,8 +268,7 @@ def _ler_jpeg(dados: bytes):
         m = dados[i + 1]
         if m == 0xD9:  # EOI: fim da imagem principal; o resto é sobra
             mantido += b"\xff\xd9"
-            descartado += dados[i + 2:]
-            return bytes(mantido), bytes(descartado)
+            return bytes(mantido), bytes(descartado), bytes(dados[i + 2:])
         if m in (0x01, 0xD8) or 0xD0 <= m <= 0xD7:
             mantido += dados[i:i + 2]
             i += 2
@@ -227,15 +292,7 @@ def _ler_jpeg(dados: bytes):
             mantido += dados[i:j]
             i = j
             continue
-        manter = False
-        if m == 0xE0:  # JFIF exato (16 bytes); JFXX e outros APP0 saem
-            manter = tam == 16 and bloco[4:9] == b"JFIF\x00"
-        elif m == 0xE2 and bloco[4:16].startswith(b"ICC_PROFILE"):
-            manter = True  # perfil de cor, não é metadado de autoria
-        elif m == 0xEE:  # flag de espaço de cor da Adobe, exata (14 bytes)
-            manter = tam == 14 and bloco[4:9] == b"Adobe"
-        elif not (0xE0 <= m <= 0xEF or m == 0xFE):
-            manter = True  # tabelas e quadros da imagem
+        manter = _jpeg_permitido(m, tam, bloco)
         if manter:
             mantido += bloco
         else:
@@ -249,9 +306,10 @@ def _tirar_segmentos_jpeg(dados: bytes) -> bytes:
 
 def limpar_jpeg(origem: str, destino: str):
     dados = open(origem, "rb").read()
-    if jpeg_orientacao(dados) != 1:
+    if jpeg_orientacao(dados) in (2, 3, 4, 5, 6, 7, 8):  # 0, 9 e outros valores inválidos não giram
         import io
         from PIL import Image, ImageOps
+        Image.MAX_IMAGE_PIXELS = None  # arquivo do próprio usuário; foto de 200 MP não é ataque
         img = ImageOps.exif_transpose(Image.open(origem))
         icc = img.info.get("icc_profile")
         extra = {"icc_profile": icc} if icc else {}
@@ -308,7 +366,7 @@ def limpar_mp4(origem: str, destino: str):
         raise RuntimeError("ffmpeg não encontrado no PATH")
     cmd = [
         "ffmpeg", "-y", "-v", "error", "-i", origem,
-        "-map", "0:v?", "-map", "0:a?",
+        "-map", "0:V?", "-map", "0:a?",  # V maiúsculo: sem capa nem miniatura embutida
         "-c", "copy",
         "-map_metadata", "-1", "-map_chapters", "-1",
         "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
@@ -316,23 +374,142 @@ def limpar_mp4(origem: str, destino: str):
         "-movflags", "+faststart",
         destino,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = _rodar(cmd)
     if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "ffmpeg falhou")
+        raise RuntimeError((r.stderr or "").strip() or "ffmpeg falhou")
     return "remux sem recodificar (vídeo e áudio idênticos)"
 
 
-def validar_saida(tipo: str, caminho: str):
-    """Garante que o arquivo limpo abre de verdade."""
+def _rodar(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+
+def _decodifica(caminho: str):
+    """Decodifica o vídeo e o áudio inteiros. Devolve (código, mensagens de erro).
+    Sem grade fixa de quadros (passthrough): vídeo de taxa variável é válido e
+    não pode gerar aviso de tempo fora de ordem."""
+    base = ["ffmpeg", "-v", "error", "-i", caminho, "-map", "0:V?", "-map", "0:a?"]
+    r = _rodar(base + ["-fps_mode", "passthrough", "-f", "null", "-"])
+    if r.returncode != 0 and "fps_mode" in r.stderr:  # ffmpeg antigo (antes do 5.1)
+        r = _rodar(base + ["-vsync", "passthrough", "-f", "null", "-"])
+    return r.returncode, r.stderr.strip()
+
+
+def _hash_dos_pacotes(caminho: str):
+    """Um hash por fluxo de vídeo e de áudio, sobre os dados gravados, sem
+    decodificar. None se este ffmpeg não souber fazer."""
+    r = _rodar(["ffmpeg", "-v", "error", "-i", caminho, "-map", "0:V?", "-map", "0:a?",
+                "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-"])
+    if r.returncode != 0:
+        return None
+    return [linha.split(",", 1)[1] for linha in r.stdout.splitlines() if "," in linha]
+
+
+def _numero(texto):
+    try:
+        return float(texto)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fluxos(caminho: str):
+    """Por fluxo de vídeo e de áudio: (parâmetros que mudam o jeito de
+    decodificar, duração exibida em segundos, quadros por segundo).
+    A duração já vem com a lista de edição aplicada. None sem ffprobe."""
+    if not shutil.which("ffprobe"):
+        return None
+    r = _rodar(["ffprobe", "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,width,height,pix_fmt,has_b_frames,sample_rate,channels,"
+                "duration,avg_frame_rate:stream_disposition=attached_pic", "-of", "json", caminho])
+    if r.returncode != 0:
+        return None
+    try:
+        fluxos = json.loads(r.stdout).get("streams", [])
+    except ValueError:
+        return None
+    out = []
+    for f in fluxos:
+        duracao = _numero(f.get("duration"))
+        if f.get("codec_type") == "video" and not (f.get("disposition") or {}).get("attached_pic"):
+            num, _, den = (f.get("avg_frame_rate") or "0/1").partition("/")
+            qps = (_numero(num) or 0) / (_numero(den) or 1)
+            out.append((("vídeo", f.get("codec_name"), f.get("width"), f.get("height"),
+                         f.get("pix_fmt"), f.get("has_b_frames")), duracao, qps))
+        elif f.get("codec_type") == "audio":
+            out.append((("áudio", f.get("codec_name"), f.get("sample_rate"), f.get("channels")),
+                        duracao, 0))
+    return out
+
+
+def validar_saida(tipo: str, caminho: str, origem: str):
+    """Garante que o arquivo limpo abre de verdade e, no vídeo, que o remonte
+    não mexeu no conteúdo: mesmos dados e mesmos parâmetros de decodificação."""
     if tipo in ("jpeg", "png"):
         from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None  # arquivo do próprio usuário; foto de 200 MP não é ataque
         with Image.open(caminho) as im:
             im.load()
-    else:
-        r = subprocess.run(["ffmpeg", "-v", "error", "-i", caminho, "-f", "null", "-"],
-                           capture_output=True, text=True)
-        if r.returncode != 0 or r.stderr.strip():
-            raise RuntimeError("o vídeo limpo não abre: " + r.stderr.strip()[:200])
+        return
+    codigo, erros = _decodifica(caminho)
+    if codigo != 0:
+        raise RuntimeError("o vídeo limpo não decodifica: " + erros[:200])
+    if erros and not _decodifica(origem)[1]:
+        raise RuntimeError("o vídeo limpo decodifica com erro que o original não tem: " + erros[:200])
+    h_origem, h_limpo = _hash_dos_pacotes(origem), _hash_dos_pacotes(caminho)
+    if h_origem is not None and h_limpo is not None and h_origem != h_limpo:
+        raise RuntimeError("o remonte não preservou os dados de vídeo e de áudio")
+    f_origem, f_limpo = _fluxos(origem), _fluxos(caminho)
+    if f_origem is None or f_limpo is None:
+        return
+    if [f[0] for f in f_origem] != [f[0] for f in f_limpo]:
+        raise RuntimeError("o remonte mudou um parâmetro de decodificação e o vídeo sairia alterado "
+                           f"(original {[f[0] for f in f_origem]}, limpo {[f[0] for f in f_limpo]})")
+    for (param, dur_o, qps), (_, dur_l, _) in zip(f_origem, f_limpo):
+        if dur_o is None or dur_l is None:
+            continue
+        # folga: um quadro e meio no vídeo; no áudio, o ajuste de início e fim do AAC
+        folga = max(0.05, 1.5 / qps) if qps else 0.12
+        if dur_l > dur_o + folga:
+            raise RuntimeError(f"a cópia mostraria um trecho que o original esconde ({param[0]}: {dur_o:.3f} s "
+                               f"no original, {dur_l:.3f} s na cópia). Acontece em vídeo cortado sem "
+                               "recodificar; exporte o vídeo de novo e limpe o arquivo exportado")
+        if dur_l < dur_o - folga:
+            raise RuntimeError(f"a cópia ficaria mais curta que o original ({param[0]}: {dur_o:.3f} s "
+                               f"no original, {dur_l:.3f} s na cópia)")
+
+
+def _ler_para_conferir(caminho: str, tipo: str) -> bytes:
+    """Bytes onde pode haver metadado. No vídeo, pula as amostras (mdat) sem
+    carregá-las: um arquivo de vários GB não pode ir inteiro para a memória."""
+    if tipo != "mp4":
+        with open(caminho, "rb") as f:
+            return f.read()
+    out = bytearray()
+    total = os.path.getsize(caminho)
+    with open(caminho, "rb") as f:
+        pos = 0
+        while pos + 8 <= total:
+            f.seek(pos)
+            cab = f.read(16)
+            tam = struct.unpack(">I", cab[:4])[0]
+            nome = cab[4:8]
+            n = 8
+            if tam == 1:
+                if len(cab) < 16:
+                    break
+                tam = struct.unpack(">Q", cab[8:16])[0]
+                n = 16
+            elif tam == 0:
+                tam = total - pos
+            if tam < n or pos + tam > total:
+                f.seek(pos)
+                out += f.read(64 * 1024 * 1024)  # estrutura estranha: lê um trecho e para
+                break
+            if nome != b"mdat":
+                f.seek(pos)
+                out += f.read(tam)
+            pos += tam
+    return bytes(out)
 
 
 LIMPADORES = {"jpeg": limpar_jpeg, "png": limpar_png, "mp4": limpar_mp4}
@@ -343,8 +520,7 @@ def analisar(caminho: str):
     if not tipo:
         print(f"[?] {caminho}: formato não suportado (use JPG, PNG, MP4 ou MOV)")
         return None
-    dados = open(caminho, "rb").read()
-    marcas = achar_marcas(dados, tipo)
+    marcas = achar_marcas(_ler_para_conferir(caminho, tipo), tipo)
     if marcas:
         print(f"[!] {os.path.basename(caminho)} ({tipo}): marcas encontradas")
         for m in marcas:
@@ -354,30 +530,49 @@ def analisar(caminho: str):
     return marcas
 
 
-def limpar(caminho: str, pasta_saida: str):
+def _chave(caminho: str) -> str:
+    """O mesmo arquivo dá a mesma chave, ainda que o caminho venha por junção,
+    link ou nome curto do Windows (por isso realpath, e não abspath)."""
+    return os.path.normcase(os.path.realpath(caminho))
+
+
+def _destino_livre(pasta_saida: str, base: str, ext: str, usados: set) -> str:
+    """O destino nunca coincide com um arquivo pedido nem com outra cópia desta
+    execução: na colisão, o nome ganha _limpo_2, _limpo_3..."""
+    destino = os.path.join(pasta_saida, f"{base}_limpo{ext}")
+    n = 2
+    while _chave(destino) in usados:
+        destino = os.path.join(pasta_saida, f"{base}_limpo_{n}{ext}")
+        n += 1
+    usados.add(_chave(destino))
+    return destino
+
+
+def limpar(caminho: str, pasta_saida: str, usados: set = None):
     tipo = tipo_do_arquivo(caminho)
     if not tipo:
-        print(f"[?] {caminho}: formato não suportado")
+        print(f"[?] {caminho}: formato não suportado (use JPG, PNG, MP4 ou MOV)")
         return False
     base, ext = os.path.splitext(os.path.basename(caminho))
     os.makedirs(pasta_saida, exist_ok=True)
-    destino = os.path.join(pasta_saida, f"{base}_limpo{ext}")
-    antes = achar_marcas(open(caminho, "rb").read(), tipo)
+    destino = _destino_livre(pasta_saida, base, ext, usados if usados is not None else set())
+    antes = achar_marcas(_ler_para_conferir(caminho, tipo), tipo)
     try:
         modo = LIMPADORES[tipo](caminho, destino)
-        validar_saida(tipo, destino)
+        validar_saida(tipo, destino, caminho)
     except Exception as e:
         if os.path.exists(destino):
             os.remove(destino)
         print(f"[x] {os.path.basename(caminho)}: {e}")
         return False
-    depois = achar_marcas(open(destino, "rb").read(), tipo, saida=True)
+    depois = achar_marcas(_ler_para_conferir(destino, tipo), tipo, saida=True)
     print(f"{os.path.basename(caminho)} -> {destino}")
     print(f"   método: {modo}")
     print(f"   antes : {len(antes)} marca(s) {antes if antes else ''}")
     print(f"   depois: {len(depois)} marca(s) {depois if depois else ''}")
     if depois:
-        print("   [x] AINDA há marcas no arquivo limpo; não use este arquivo")
+        os.remove(destino)
+        print("   [x] AINDA há marcas depois da limpeza; a cópia foi descartada")
         return False
     print("   [ok] arquivo limpo")
     return True
@@ -394,20 +589,34 @@ def main():
     p.add_argument("--saida", help="pasta de saída (padrão: subpasta 'limpos' ao lado do original)")
     a = p.parse_args()
     ok = True
+    # destinos já gravados nesta execução; começa com os próprios pedidos,
+    # para a cópia limpa de um nunca cair em cima do original de outro
+    usados = {_chave(x) for x in a.arquivos}
+    nao_limpos = []  # pedidos que ficaram de fora; o motivo já foi impresso acima
     for arq in a.arquivos:
         if not os.path.isfile(arq):
-            print(f"[x] {arq}: arquivo não encontrado")
+            motivo = "é uma pasta; passe os arquivos dela" if os.path.isdir(arq) else "arquivo não encontrado"
+            print(f"[x] {arq}: {motivo}")
             ok = False
+            nao_limpos.append(arq)
             continue
         if a.acao == "analisar":
             analisar(arq)
         else:
             pasta = a.saida or os.path.join(os.path.dirname(os.path.abspath(arq)), "limpos")
             try:
-                ok = limpar(arq, pasta) and ok
+                feito = limpar(arq, pasta, usados)
             except Exception as e:
                 print(f"[x] {arq}: {e}")
-                ok = False
+                feito = False
+            if not feito:
+                nao_limpos.append(arq)
+            ok = feito and ok
+    if a.acao == "limpar":
+        total = len(a.arquivos)
+        print(f"Resumo: {total - len(nao_limpos)} de {total} arquivo(s) limpo(s)")
+        for arq in nao_limpos:
+            print(f"   não limpo: {arq}")
     sys.exit(0 if ok else 1)
 
 
